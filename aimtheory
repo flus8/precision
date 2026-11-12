@@ -1,0 +1,904 @@
+
+--[[
+    PRECISION
+    Redesigned Dark UI
+
+    - Right Shift hides/shows entire menu
+    - No floating minimize button
+    - Smoothness, FOV, speed, reaction delay
+    - Target ESP and FOV circle
+    - Yellow balls, squares, capsules, bots
+    - Dynamic target folder detection
+    - Hold right-click to activate
+    - Aim Height removed
+]]
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RS = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local pg = player:WaitForChild("PlayerGui")
+
+-- CLEANUP OLD SCRIPT
+if _G.BallAimCleanup then
+    pcall(_G.BallAimCleanup)
+end
+
+if _G.BallAimConnection then
+    pcall(function()
+        _G.BallAimConnection:Disconnect()
+    end)
+end
+
+for _, name in ipairs({
+    "BallAim", "BallAimV4", "BallAimV5",
+    "BallAimV6", "BallAimV7", "BallAimV8",
+    "BallAimV9", "BallAimV10",
+    "BallAimV11", "PrecisionV12", "PrecisionUI"
+}) do
+    local old = pg:FindFirstChild(name)
+    if old then old:Destroy() end
+end
+
+-- SETTINGS
+local settings = {
+    enabled = false,
+    smoothness = 0.95,
+    fov = 600,
+    maxSpeed = 20000,
+    reactionDelay = 0,
+    showFov = true,
+    showTarget = true
+}
+
+local currentTarget
+local acquiredAt = 0
+local trackingVelocity = Vector2.zero
+local remainder = Vector2.zero
+local dragging = false
+local menuVisible = true
+local connections = {}
+local highlight
+local circle
+
+-- THEME
+local C = {
+    bg = Color3.fromRGB(13, 15, 24),
+    surface = Color3.fromRGB(22, 25, 37),
+    elevated = Color3.fromRGB(33, 37, 54),
+    line = Color3.fromRGB(53, 59, 80),
+    accent = Color3.fromRGB(132, 109, 255),
+    accent2 = Color3.fromRGB(89, 122, 255),
+    text = Color3.fromRGB(246, 247, 255),
+    muted = Color3.fromRGB(139, 147, 172),
+    green = Color3.fromRGB(72, 225, 158),
+    red = Color3.fromRGB(255, 95, 115),
+    yellow = Color3.fromRGB(255, 196, 99)
+}
+
+local function connect(signal, callback)
+    local c = signal:Connect(callback)
+    table.insert(connections, c)
+    return c
+end
+
+local function create(class, props, parent)
+    local obj = Instance.new(class)
+
+    for k, v in pairs(props) do
+        obj[k] = v
+    end
+
+    obj.Parent = parent
+    return obj
+end
+
+local function round(obj, radius)
+    create("UICorner", {
+        CornerRadius = UDim.new(0, radius)
+    }, obj)
+end
+
+local function stroke(obj, color, thickness)
+    return create("UIStroke", {
+        Color = color or C.line,
+        Thickness = thickness or 1
+    }, obj)
+end
+
+local function tween(obj, props, duration)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(
+            duration or 0.16,
+            Enum.EasingStyle.Quad,
+            Enum.EasingDirection.Out
+        ),
+        props
+    ):Play()
+end
+
+local function resetTracking()
+    currentTarget = nil
+    trackingVelocity = Vector2.zero
+    remainder = Vector2.zero
+    acquiredAt = 0
+end
+
+-- DYNAMIC ARENA DETECTION
+local function getTargetFolders()
+    local arena = workspace:FindFirstChild(
+        "AimTheoryArena"
+    )
+
+    if not arena then
+        return {}, "WAITING"
+    end
+
+    local folders = {}
+
+    local balls = arena:FindFirstChild("Targets")
+    local bots = arena:FindFirstChild("Bots")
+
+    if balls then
+        table.insert(folders, balls)
+    end
+
+    if bots then
+        table.insert(folders, bots)
+    end
+
+    if balls and bots then
+        return folders, "MIXED"
+    elseif balls then
+        return folders, "BALLS"
+    elseif bots then
+        return folders, "BOTS"
+    end
+
+    return folders, "WAITING"
+end
+
+-- REFINED UI
+local gui = create("ScreenGui", {
+    Name = "PrecisionUI",
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    DisplayOrder = 150
+}, pg)
+
+local panel = create("Frame", {
+    Name = "MainWindow",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(382, 568),
+    Position = UDim2.fromScale(0.5, 0.5),
+    BackgroundColor3 = C.bg,
+    BorderSizePixel = 0,
+    Active = true
+}, gui)
+round(panel, 18)
+stroke(panel, C.line, 1)
+
+-- Thin gradient accent across the top
+local accentBar = create("Frame", {
+    Position = UDim2.fromOffset(18, 0),
+    Size = UDim2.new(1, -36, 0, 3),
+    BackgroundColor3 = C.accent,
+    BorderSizePixel = 0
+}, panel)
+round(accentBar, 3)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, C.accent),
+        ColorSequenceKeypoint.new(1, C.accent2)
+    })
+}, accentBar)
+
+local header = create("Frame", {
+    Name = "DragHandle",
+    Size = UDim2.new(1, 0, 0, 79),
+    BackgroundTransparency = 1,
+    Active = true
+}, panel)
+local emblem = create("Frame", {
+    Position = UDim2.fromOffset(20, 19),
+    Size = UDim2.fromOffset(43, 43),
+    BackgroundColor3 = C.elevated,
+    BorderSizePixel = 0
+}, header)
+round(emblem, 13)
+stroke(emblem, C.accent, 1)
+create("TextLabel", {
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    Text = "+",
+    TextColor3 = C.accent,
+    TextSize = 27,
+    Font = Enum.Font.GothamBold
+}, emblem)
+create("TextLabel", {
+    Position = UDim2.fromOffset(77, 16),
+    Size = UDim2.fromOffset(220, 29),
+    BackgroundTransparency = 1,
+    Text = "PRECISION",
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = C.text,
+    TextSize = 22,
+    Font = Enum.Font.GothamBold
+}, header)
+create("TextLabel", {
+    Position = UDim2.fromOffset(78, 44),
+    Size = UDim2.fromOffset(240, 17),
+    BackgroundTransparency = 1,
+    Text = "TARGET CONTROL  /  CONTROL PANEL",
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = C.muted,
+    TextSize = 10,
+    Font = Enum.Font.GothamMedium
+}, header)
+local hideButton = create("TextButton", {
+    Position = UDim2.new(1, -46, 0, 21),
+    Size = UDim2.fromOffset(28, 28),
+    Text = "×",
+    TextSize = 19,
+    TextColor3 = C.muted,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = true,
+    BackgroundColor3 = C.elevated
+}, header)
+round(hideButton, 8)
+create("Frame", {
+    Position = UDim2.fromOffset(0, 78),
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = C.line,
+    BorderSizePixel = 0
+}, panel)
+
+-- MODE / STATUS display
+local function infoCard(x, width, heading, initial)
+    local card = create("Frame", {
+        Position = UDim2.fromOffset(x, 94),
+        Size = UDim2.fromOffset(width, 56),
+        BackgroundColor3 = C.surface,
+        BorderSizePixel = 0
+    }, panel)
+    round(card, 11)
+    create("TextLabel", {
+        Position = UDim2.fromOffset(12, 7),
+        Size = UDim2.new(1, -24, 0, 16),
+        BackgroundTransparency = 1,
+        Text = heading,
+        TextColor3 = C.muted,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextSize = 10,
+        Font = Enum.Font.GothamMedium
+    }, card)
+    return create("TextLabel", {
+        Position = UDim2.fromOffset(12, 25),
+        Size = UDim2.new(1, -24, 0, 22),
+        BackgroundTransparency = 1,
+        Text = initial,
+        TextColor3 = C.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextSize = 13,
+        Font = Enum.Font.GothamBold
+    }, card)
+end
+local modeLabel = infoCard(18, 165, "GAME MODE", "DETECTING")
+local statusLabel = infoCard(195, 169, "AIM STATUS", "DISABLED")
+local lastStatus = ""
+local function setStatus(message, color)
+    if lastStatus ~= message then
+        lastStatus = message
+        statusLabel.Text = message
+    end
+    statusLabel.TextColor3 = color or C.text
+end
+
+-- ON/OFF switch
+local enableButton = create("TextButton", {
+    Position = UDim2.fromOffset(18, 163),
+    Size = UDim2.fromOffset(346, 48),
+    BackgroundColor3 = C.elevated,
+    BorderSizePixel = 0,
+    Text = "",
+    AutoButtonColor = false
+}, panel)
+round(enableButton, 11)
+local enableTitle = create("TextLabel", {
+    Position = UDim2.fromOffset(15, 3),
+    Size = UDim2.fromOffset(240, 25),
+    BackgroundTransparency = 1,
+    Text = "Target assist",
+    TextColor3 = C.text,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamBold
+}, enableButton)
+create("TextLabel", {
+    Position = UDim2.fromOffset(15, 26),
+    Size = UDim2.fromOffset(245, 16),
+    BackgroundTransparency = 1,
+    Text = "Hold right-click to track targets",
+    TextColor3 = C.muted,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamMedium
+}, enableButton)
+local switchTrack = create("Frame", {
+    Position = UDim2.new(1, -57, 0.5, -12),
+    Size = UDim2.fromOffset(42, 24),
+    BackgroundColor3 = Color3.fromRGB(77, 82, 101),
+    BorderSizePixel = 0
+}, enableButton)
+round(switchTrack, 12)
+local switchKnob = create("Frame", {
+    Position = UDim2.fromOffset(3, 3),
+    Size = UDim2.fromOffset(18, 18),
+    BackgroundColor3 = C.text,
+    BorderSizePixel = 0
+}, switchTrack)
+round(switchKnob, 9)
+local function updateEnable()
+    tween(switchTrack, {
+        BackgroundColor3 = settings.enabled and C.accent or Color3.fromRGB(77, 82, 101)
+    })
+    tween(switchKnob, {
+        Position = settings.enabled and UDim2.fromOffset(21, 3) or UDim2.fromOffset(3, 3)
+    })
+    tween(enableButton, {
+        BackgroundColor3 = settings.enabled and Color3.fromRGB(44, 39, 78) or C.elevated
+    })
+end
+connect(enableButton.Activated, function()
+    settings.enabled = not settings.enabled
+    resetTracking()
+    updateEnable()
+end)
+
+local function sectionTitle(title, y)
+    create("TextLabel", {
+        Position = UDim2.fromOffset(20, y),
+        Size = UDim2.fromOffset(270, 17),
+        BackgroundTransparency = 1,
+        Text = title,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = C.muted,
+        TextSize = 10,
+        Font = Enum.Font.GothamBold
+    }, panel)
+end
+sectionTitle("TRACKING", 223)
+
+-- Click/drag-friendly sliders
+local function slider(name, y, minV, maxV, initial, callback, fmt)
+    create("TextLabel", {
+        Position = UDim2.fromOffset(20, y),
+        Size = UDim2.fromOffset(235, 18),
+        BackgroundTransparency = 1,
+        Text = name,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = C.text,
+        TextSize = 12,
+        Font = Enum.Font.GothamMedium
+    }, panel)
+    local valueLabel = create("TextLabel", {
+        Position = UDim2.fromOffset(260, y),
+        Size = UDim2.fromOffset(102, 18),
+        BackgroundTransparency = 1,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = C.accent,
+        TextSize = 12,
+        Font = Enum.Font.GothamBold
+    }, panel)
+    local hitbox = create("TextButton", {
+        Position = UDim2.fromOffset(20, y + 21),
+        Size = UDim2.fromOffset(342, 19),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        Active = true
+    }, panel)
+    local track = create("Frame", {
+        Position = UDim2.fromOffset(0, 7),
+        Size = UDim2.new(1, 0, 0, 5),
+        BackgroundColor3 = C.elevated,
+        BorderSizePixel = 0
+    }, hitbox)
+    round(track, 3)
+    local fill = create("Frame", {
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = C.accent,
+        BorderSizePixel = 0
+    }, track)
+    round(fill, 3)
+    local knob = create("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = C.text,
+        BorderSizePixel = 0
+    }, track)
+    round(knob, 7)
+    local sliding = false
+    local function update(value)
+        value = math.clamp(value, minV, maxV)
+        local a = (value - minV) / (maxV - minV)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.fromScale(a, 0.5)
+        valueLabel.Text = string.format(fmt, value)
+        callback(value)
+    end
+    local function fromMouse(x)
+        local a = math.clamp(
+            (x - hitbox.AbsolutePosition.X) / math.max(hitbox.AbsoluteSize.X, 1), 0, 1
+        )
+        update(minV + a * (maxV - minV))
+    end
+    connect(hitbox.InputBegan, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            sliding = true
+            fromMouse(input.Position.X)
+        end
+    end)
+    connect(UIS.InputChanged, function(input)
+        if sliding and input.UserInputType == Enum.UserInputType.MouseMovement then
+            fromMouse(input.Position.X)
+        end
+    end)
+    connect(UIS.InputEnded, function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            sliding = false
+        end
+    end)
+    update(initial)
+end
+slider("Smoothness", 247, 0.05, 1, settings.smoothness,
+    function(v) settings.smoothness = v end, "%.2f")
+slider("FOV radius", 293, 25, 1200, settings.fov,
+    function(v) settings.fov = v end, "%.0f px")
+slider("Maximum speed", 339, 1000, 50000, settings.maxSpeed,
+    function(v) settings.maxSpeed = v end, "%.0f")
+slider("Reaction delay", 385, 0, 0.30, settings.reactionDelay,
+    function(v) settings.reactionDelay = v end, "%.2f s")
+
+sectionTitle("VISUALS", 435)
+local function visualToggle(label, x, key)
+    local b = create("TextButton", {
+        Position = UDim2.fromOffset(x, 459),
+        Size = UDim2.fromOffset(166, 40),
+        BackgroundColor3 = C.elevated,
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0
+    }, panel)
+    round(b, 9)
+    local dot = create("Frame", {
+        Position = UDim2.fromOffset(12, 16),
+        Size = UDim2.fromOffset(8, 8),
+        BackgroundColor3 = C.green,
+        BorderSizePixel = 0
+    }, b)
+    round(dot, 4)
+    local textLabel = create("TextLabel", {
+        Position = UDim2.fromOffset(27, 0),
+        Size = UDim2.new(1, -36, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+        TextColor3 = C.text,
+        TextSize = 11,
+        Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Left
+    }, b)
+    local function update()
+        textLabel.Text = label .. (settings[key] and "  ON" or "  OFF")
+        tween(dot, {
+            BackgroundColor3 = settings[key] and C.green or C.muted
+        })
+    end
+    connect(b.Activated, function()
+        settings[key] = not settings[key]
+        update()
+    end)
+    update()
+end
+visualToggle("FOV circle", 18, "showFov")
+visualToggle("Target ESP", 198, "showTarget")
+
+local footer = create("Frame", {
+    Position = UDim2.fromOffset(18, 511),
+    Size = UDim2.fromOffset(346, 1),
+    BorderSizePixel = 0,
+    BackgroundColor3 = C.line
+}, panel)
+create("TextLabel", {
+    Position = UDim2.fromOffset(19, 519),
+    Size = UDim2.fromOffset(344, 33),
+    BackgroundTransparency = 1,
+    Text = "RIGHT SHIFT   Hide / show menu       RMB   Hold to aim",
+    TextColor3 = C.muted,
+    TextSize = 10,
+    Font = Enum.Font.GothamMedium
+}, panel)
+
+-- Drag window by its header
+local dragStart, panelStart
+connect(header.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        panelStart = panel.Position
+    end
+end)
+connect(UIS.InputChanged, function(input)
+    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local d = input.Position - dragStart
+        panel.Position = UDim2.new(
+            panelStart.X.Scale, panelStart.X.Offset + d.X,
+            panelStart.Y.Scale, panelStart.Y.Offset + d.Y
+        )
+    end
+end)
+connect(UIS.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end)
+
+local function setMenuVisible(visible)
+    menuVisible = visible
+    panel.Visible = visible
+    dragging = false
+end
+connect(hideButton.Activated, function()
+    setMenuVisible(false)
+end)
+connect(UIS.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.RightShift then
+        setMenuVisible(not menuVisible)
+    end
+end)
+
+-- TARGET HIGHLIGHT
+local function clearHighlight()
+    if highlight then
+        highlight:Destroy()
+        highlight = nil
+    end
+end
+
+local function updateHighlight(target)
+    if not settings.showTarget or not target then
+        clearHighlight()
+        return
+    end
+
+    if highlight and highlight.Adornee == target then
+        return
+    end
+
+    clearHighlight()
+
+    highlight = Instance.new("Highlight")
+    highlight.Name = "PrecisionTargetHighlight"
+    highlight.Adornee = target
+    highlight.FillColor = C.green
+    highlight.OutlineColor = C.text
+    highlight.FillTransparency = 0.65
+    highlight.DepthMode =
+        Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = target
+end
+
+-- FOV CIRCLE
+if type(Drawing) == "table"
+    and type(Drawing.new) == "function" then
+
+    local ok, result = pcall(function()
+        local c = Drawing.new("Circle")
+        c.Color = C.accent
+        c.Thickness = 1.5
+        c.NumSides = 64
+        c.Filled = false
+        c.Visible = false
+        return c
+    end)
+
+    if ok then
+        circle = result
+    end
+end
+
+-- YELLOW TARGET DETECTION
+local function isYellow(part)
+    if not part:IsA("BasePart") then
+        return false
+    end
+
+    local h, s, v = part.Color:ToHSV()
+
+    return h >= 0.10
+        and h <= 0.19
+        and s >= 0.65
+        and v >= 0.65
+end
+
+local function validTarget(part, mode)
+    if not isYellow(part) then
+        return false
+    end
+
+    if mode == "BOTS" then
+        local name = part.Name:lower()
+
+        if name:find("captop", 1, true)
+            or name:find("capbottom", 1, true) then
+
+            return false
+        end
+    end
+
+    return true
+end
+
+-- TARGET CENTER
+local function getScreenPosition(part)
+    local camera = workspace.CurrentCamera
+
+    if not camera then
+        return nil
+    end
+
+    local pos, visible =
+        camera:WorldToViewportPoint(part.Position)
+
+    if not visible or pos.Z <= 0 then
+        return nil
+    end
+
+    return Vector2.new(pos.X, pos.Y)
+end
+
+-- FIND CLOSEST TARGET
+local function findTarget()
+    local folders, mode = getTargetFolders()
+
+    if #folders == 0 then
+        return nil, mode
+    end
+
+    local mouse = UIS:GetMouseLocation()
+    local closest
+    local bestScore = math.huge
+
+    for _, folder in ipairs(folders) do
+        local folderMode =
+            folder.Name == "Bots"
+            and "BOTS"
+            or "BALLS"
+
+        for _, part in ipairs(
+            folder:GetDescendants()
+        ) do
+
+            if validTarget(part, folderMode)
+                and part:IsDescendantOf(workspace) then
+
+                local pos = getScreenPosition(part)
+
+                if pos then
+                    local distance =
+                        (pos - mouse).Magnitude
+
+                    if distance <= settings.fov then
+                        local score = distance
+
+                        if folderMode == "BOTS"
+                            and part.Name:lower():find(
+                                "head", 1, true
+                            ) then
+
+                            score *= 0.85
+                        end
+
+                        if part == currentTarget then
+                            score *= 0.95
+                        end
+
+                        if score < bestScore then
+                            closest = part
+                            bestScore = score
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return closest, mode
+end
+
+-- TRACKING MOVEMENT
+local function calculateMovement(
+    targetPos, mousePos, dt
+)
+    dt = math.clamp(dt, 0.001, 0.05)
+
+    local error = targetPos - mousePos
+    local distance = error.Magnitude
+
+    if distance < 1 then
+        trackingVelocity = Vector2.zero
+        remainder = Vector2.zero
+        return Vector2.zero
+    end
+
+    local gain =
+        35 + settings.smoothness * 100
+
+    local desiredSpeed = math.min(
+        settings.maxSpeed,
+        distance * gain
+    )
+
+    local desiredVelocity =
+        error.Unit * desiredSpeed
+
+    local response = 1 - math.exp(
+        -(35 + settings.smoothness * 90) * dt
+    )
+
+    trackingVelocity = trackingVelocity:Lerp(
+        desiredVelocity,
+        response
+    )
+
+    local movement = trackingVelocity * dt
+
+    if movement.Magnitude > distance then
+        movement = error
+        trackingVelocity = Vector2.zero
+    end
+
+    movement += remainder
+
+    local rounded = Vector2.new(
+        math.round(movement.X),
+        math.round(movement.Y)
+    )
+
+    remainder = movement - rounded
+
+    return rounded
+end
+
+-- MAIN LOOP
+local renderConnection = connect(
+    RS.RenderStepped,
+    function(dt)
+        local mouse = UIS:GetMouseLocation()
+
+        if circle then
+            pcall(function()
+                circle.Position = mouse
+                circle.Radius = settings.fov
+                circle.Visible = settings.showFov
+            end)
+        end
+
+        local _, detectedMode = getTargetFolders()
+        modeLabel.Text = detectedMode
+
+        if not settings.enabled then
+            resetTracking()
+            clearHighlight()
+            setStatus("DISABLED", C.muted)
+            return
+        end
+
+        local holdingRMB = UIS:IsMouseButtonPressed(
+            Enum.UserInputType.MouseButton2
+        )
+
+        if not holdingRMB then
+            resetTracking()
+            clearHighlight()
+            setStatus("HOLD RMB", C.yellow)
+            return
+        end
+
+        local newTarget, mode = findTarget()
+        modeLabel.Text = mode
+
+        if newTarget ~= currentTarget then
+            currentTarget = newTarget
+            acquiredAt = os.clock()
+            trackingVelocity = Vector2.zero
+            remainder = Vector2.zero
+        end
+
+        if not currentTarget then
+            clearHighlight()
+
+            setStatus(
+                mode == "WAITING"
+                    and "WAITING"
+                    or "NO TARGET",
+                C.red
+            )
+
+            return
+        end
+
+        updateHighlight(currentTarget)
+
+        local targetPos =
+            getScreenPosition(currentTarget)
+
+        if not targetPos then
+            clearHighlight()
+            setStatus("OFF SCREEN", C.red)
+            return
+        end
+
+        if os.clock() - acquiredAt
+            < settings.reactionDelay then
+
+            setStatus("ACQUIRING", C.yellow)
+            return
+        end
+
+        if type(mousemoverel) ~= "function" then
+            setStatus("API MISSING", C.red)
+            return
+        end
+
+        local movement = calculateMovement(
+            targetPos,
+            mouse,
+            dt
+        )
+
+        if movement.Magnitude > 0 then
+            local ok = pcall(function()
+                mousemoverel(
+                    movement.X,
+                    movement.Y
+                )
+            end)
+
+            if not ok then
+                setStatus("MOUSE ERROR", C.red)
+                return
+            end
+        end
+
+        setStatus("TRACKING", C.green)
+    end
+)
+
+_G.BallAimConnection = renderConnection
+
+-- CLEANUP
+_G.BallAimCleanup = function()
+    for _, c in ipairs(connections) do
+        c:Disconnect()
+    end
+
+    clearHighlight()
+
+    if circle then
+        pcall(function()
+            circle:Remove()
+        end)
+    end
+
+    gui:Destroy()
+end
+
+print("PRECISION UI LOADED")
+print("Right Shift: Hide / Show entire menu")
+print("RMB: Hold to aim")
+print("Aim Height: Removed")
